@@ -519,7 +519,7 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
           onClose();
         }
       }}>
-        <DialogContent className="sm:max-w-[425px]">
+        <DialogContent className="sm:max-w-[425px] max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Update Profile Picture</DialogTitle>
             <DialogDescription>
