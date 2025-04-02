@@ -10,11 +10,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/components/ui/use-toast";
-import { Loader2, Upload, AlertCircle, Camera, Image as ImageIcon, Trash, X } from "lucide-react";
+import { Loader2, Upload, AlertCircle, Camera as CameraIconLucide, Image as ImageIcon, Trash, X } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import imageCompression from "browser-image-compression";
+import { Capacitor } from '@capacitor/core';
+import { Camera, CameraResultType, CameraSource, PermissionStatus } from '@capacitor/camera';
 
 interface AvatarUploadPopupProps {
   isOpen: boolean;
@@ -34,6 +36,22 @@ const getInitials = (name: string) => {
     .substring(0, 2);
 };
 
+// Helper to convert Data URL to Blob
+function dataURLtoBlob(dataurl: string) {
+    const arr = dataurl.split(',');
+    if (arr.length < 2) return null;
+    const mimeMatch = arr[0].match(/:(.*?);/);
+    if (!mimeMatch) return null;
+    const mime = mimeMatch[1];
+    const bstr = atob(arr[1]);
+    let n = bstr.length;
+    const u8arr = new Uint8Array(n);
+    while(n--){
+        u8arr[n] = bstr.charCodeAt(n);
+    }
+    return new Blob([u8arr], {type:mime});
+}
+
 const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
   isOpen,
   onClose,
@@ -47,151 +65,219 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
   const [imagePreview, setImagePreview] = useState<string | null>(currentAvatar || null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<string>(currentAvatar ? "upload" : "upload");
+  const [activeTab, setActiveTab] = useState<string>("upload");
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [hasCheckedCameraSupport, setHasCheckedCameraSupport] = useState(false);
+  const [hasCameraSupportState, setHasCameraSupportState] = useState(false);
 
-  // Effect to handle camera stream when component unmounts
-  const stopCamera = () => {
+  const isNative = Capacitor.isNativePlatform();
+
+  // Function to check camera support (runs once)
+  const checkCameraSupport = async () => {
+    if (hasCheckedCameraSupport) return hasCameraSupportState;
+
+    let supported = false;
+    if (isNative) {
+      supported = Capacitor.isPluginAvailable('Camera');
+    } else {
+      supported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    }
+    setHasCameraSupportState(supported);
+    setHasCheckedCameraSupport(true);
+    return supported;
+  };
+
+  // Run check on mount or when isOpen changes
+  useEffect(() => {
+    if (isOpen) {
+      checkCameraSupport();
+      // Reset state when opening
+      setImageFile(null);
+      setImagePreview(currentAvatar || null);
+      setError(null);
+      setIsSubmitting(false);
+      setActiveTab("upload"); // Always default to upload when opening
+    } else {
+      // Cleanup when closing
+      stopWebCamera();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, currentAvatar]); // Add currentAvatar to dependencies
+
+  // --- Native Camera Logic ---
+  const takeNativePhoto = async () => {
+    setError(null);
+    setIsSubmitting(true); // Use submitting state for loading indicator
+
+    try {
+        // 1. Check & Request Permissions
+        let permissionStatus: PermissionStatus = await Camera.checkPermissions();
+        if (permissionStatus.camera !== 'granted') {
+            permissionStatus = await Camera.requestPermissions({ permissions: ['camera'] });
+        }
+
+        if (permissionStatus.camera !== 'granted') {
+            setError("Camera permission denied. Please grant access in settings.");
+            toast({ title: "Permission Denied", description: "Camera access is required to take a photo.", variant: "destructive" });
+            setIsSubmitting(false);
+            return;
+        }
+
+        // 2. Take Photo
+        const image = await Camera.getPhoto({
+            quality: 90,
+            allowEditing: true, // Let user crop/adjust
+            resultType: CameraResultType.DataUrl, // Get Data URL for easy preview & conversion
+            source: CameraSource.Camera, // Use the camera
+            saveToGallery: false // Don't save to gallery by default for profile pics
+        });
+
+        if (image.dataUrl) {
+            // 3. Process Image
+            setImagePreview(image.dataUrl); // Show preview immediately
+
+            const blob = dataURLtoBlob(image.dataUrl);
+            if (!blob) {
+              throw new Error("Could not convert photo data to Blob.");
+            }
+
+            const timestamp = new Date().getTime();
+            const newFile = new File([blob], `profile-photo-${timestamp}.jpg`, { type: 'image/jpeg' });
+
+            // 4. Compress (Optional but recommended)
+            const compressedFile = await compressImage(newFile);
+            setImageFile(compressedFile);
+            setImagePreview(URL.createObjectURL(compressedFile)); // Update preview with compressed version if different
+
+            // 5. Submit (or let user confirm) - using existing handleSubmit
+             await handleSubmit(compressedFile); // Auto-submit after taking photo
+
+        } else {
+             setError("Failed to get photo data. Please try again.");
+        }
+
+    } catch (err: any) {
+        console.error("Error taking native photo:", err);
+        if (err.message && err.message.toLowerCase().includes('cancelled')) {
+            setError("Photo capture cancelled.");
+        } else if (err.message && err.message.toLowerCase().includes('permission')) {
+             setError("Camera permission denied.");
+        }
+        else {
+            setError(`Error taking photo: ${err.message || "Unknown error"}`);
+        }
+    } finally {
+         setIsSubmitting(false);
+    }
+};
+
+
+  // --- Web Camera Logic (Fallback) ---
+  const stopWebCamera = () => {
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
       setCameraStream(null);
-      
       if (videoRef.current) {
         videoRef.current.srcObject = null;
       }
     }
   };
 
-  const startCamera = async () => {
+  const startWebCamera = async () => {
+     if (isNative) return; // Should not be called on native
     try {
-      // Stop any existing stream first
-      stopCamera();
-      
-      // Get access to the camera
+      stopWebCamera();
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { 
-          facingMode: 'user', // Use front camera for profile photos
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
+        video: {
+          facingMode: 'user',
+          width: { ideal: 640 }, // Smaller resolution for web preview
+          height: { ideal: 480 }
         },
         audio: false
       });
-      
-      // Store the stream and set it as the source for the video element
       setCameraStream(stream);
-      
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
-      
       setError(null);
     } catch (err: any) {
-      console.error("Error accessing camera:", err);
-      setError(`Camera access error: ${err.message}. Please try using image upload instead.`);
+      console.error("Error accessing web camera:", err);
+      setError(`Web camera access error: ${err.message}. Try image upload?`);
       setActiveTab("upload");
     }
   };
 
-  const capturePhoto = () => {
-    if (!videoRef.current || !cameraStream) {
-      setError("Camera not available. Please try again or use image upload.");
-      return;
-    }
-    
+  const captureWebPhoto = () => {
+     if (isNative || !videoRef.current || !cameraStream) {
+        setError("Web camera not available.");
+        return;
+     }
+
     try {
-      // Create a canvas element to capture the current frame
       const canvas = document.createElement('canvas');
       const video = videoRef.current;
-      
-      // Set canvas dimensions to match the video
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
-      
-      // Draw the current video frame to the canvas
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        throw new Error("Could not get canvas context");
-      }
-      
+      if (!ctx) throw new Error("Could not get canvas context");
+
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      
-      // Convert the canvas to a blob and then to a File object
+
       canvas.toBlob(async (blob) => {
         if (!blob) {
-          setError("Failed to capture image. Please try again.");
+          setError("Failed to capture web image.");
           return;
         }
-        
         const timestamp = new Date().getTime();
         const newFile = new File([blob], `profile-photo-${timestamp}.jpg`, { type: 'image/jpeg' });
-        
+
         try {
-          // Compress the image if it's large
           const compressedFile = await compressImage(newFile);
-          
-          // Set the image file and preview
           setImageFile(compressedFile);
           setImagePreview(URL.createObjectURL(compressedFile));
-          
-          // Stop the camera after capturing
-          stopCamera();
-          
-          // Switch to preview tab
-          setActiveTab("preview");
+          stopWebCamera(); // Stop camera after capture
+          setActiveTab("preview"); // Switch to preview/save tab for web
         } catch (err: any) {
-          setError(`Error processing image: ${err.message}`);
+          setError(`Error processing web image: ${err.message}`);
         }
       }, 'image/jpeg', 0.9);
     } catch (err: any) {
-      console.error("Error capturing photo:", err);
-      setError(`Failed to capture photo: ${err.message}`);
+      console.error("Error capturing web photo:", err);
+      setError(`Failed to capture web photo: ${err.message}`);
     }
   };
 
+  // --- Shared Logic ---
   const compressImage = async (file: File): Promise<File> => {
     try {
-      // Image compression options
       const options = {
-        maxSizeMB: 1,         // Maximum size in MB
-        maxWidthOrHeight: 1000, // Maximum width/height in pixels
-        useWebWorker: true,   // Use web worker for better performance
-        initialQuality: 0.9,   // Initial quality (0 to 1)
+        maxSizeMB: 1,
+        maxWidthOrHeight: 1000,
+        useWebWorker: true,
+        initialQuality: 0.9,
       };
-      
-      // Compress the image
       return await imageCompression(file, options);
     } catch (err) {
       console.error("Image compression failed:", err);
-      return file; // Return original file if compression fails
+      // Don't show error toast here, just return original
+      return file;
     }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
     if (file) {
-      // Validate file is an image
       if (!file.type.startsWith("image/")) {
         setError("Please select an image file");
         return;
       }
-      
       try {
-        // Compress the image
-        const compressedFile = await compressImage(file);
-        
-        setImageFile(compressedFile);
         setError(null);
-        
-        // Create a preview
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          setImagePreview(e.target?.result as string);
-        };
-        reader.readAsDataURL(compressedFile);
-        
-        // Switch to preview tab
-        setActiveTab("preview");
+        const compressedFile = await compressImage(file);
+        setImageFile(compressedFile);
+        setImagePreview(URL.createObjectURL(compressedFile));
+        setActiveTab("preview"); // Switch to preview tab
       } catch (err: any) {
         console.error("Error processing file:", err);
         setError("Error processing file. Please try again.");
@@ -201,7 +287,6 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
 
   const handleDelete = async () => {
     if (!currentAvatar) return;
-    
     setIsSubmitting(true);
     setError(null);
     
@@ -271,6 +356,7 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
       
       // Update UI
       setImagePreview(null);
+      setImageFile(null);
       onAvatarUpdate(null);
       
       toast({
@@ -288,38 +374,40 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
     }
   };
 
-  const handleSubmit = async () => {
-    if (!imageFile) {
-      setError("Please select or capture an image first");
+  // Modified handleSubmit to accept optional file argument (for native camera flow)
+  const handleSubmit = async (fileToSubmit: File | null = imageFile) => {
+    if (!fileToSubmit) {
+      setError("No image selected or captured to save.");
       return;
     }
-    
+
     setIsSubmitting(true);
     setError(null);
-    
+
     try {
       // Upload the image to Supabase Storage
       const filePath = `avatars/${userId}/${Date.now()}.jpg`;
-      
+
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('avatars')
-        .upload(filePath, imageFile, {
-          upsert: true
+        .upload(filePath, fileToSubmit, {
+          upsert: true,
+          contentType: 'image/jpeg'
         });
-      
+
       if (uploadError) {
         throw uploadError;
       }
-      
+
       // Get the public URL for the uploaded image
       const { data: urlData } = await supabase.storage
         .from('avatars')
         .getPublicUrl(filePath);
-      
+
       if (!urlData?.publicUrl) {
         throw new Error("Failed to get URL for uploaded image");
       }
-      
+
       // Try to determine the correct column name in the users table
       try {
         // First, try with avatar_url
@@ -327,54 +415,62 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
           .from('users')
           .update({ avatar_url: urlData.publicUrl })
           .eq('id', userId);
-        
+
         if (updateError) {
           console.error("Error updating with avatar_url, trying alternative field names:", updateError);
-          
+
           // If that fails, try alternative column names
           const possibleFields = ['avatarUrl', 'avatar', 'profile_picture', 'profilePicture', 'photo'];
           let updated = false;
-          
+
           for (const field of possibleFields) {
             const updateData = { [field]: urlData.publicUrl };
             const { error } = await supabase
               .from('users')
               .update(updateData)
               .eq('id', userId);
-            
+
             if (!error) {
               console.log(`Successfully updated avatar using field: ${field}`);
               updated = true;
               break;
             }
           }
-          
+
           if (!updated) {
-            throw new Error("Could not update user profile with avatar URL");
+              // If still failing, log but don't block UI update
+             console.error("Could not update user profile with avatar URL after trying multiple fields.");
+             toast({
+                title: "Profile Updated (DB Error)",
+                description: "Avatar uploaded, but failed to link to profile. Contact support.",
+                variant: "destructive",
+                duration: 5000,
+            });
+             // Proceed to update UI anyway
           }
         }
       } catch (err: any) {
         console.error("Avatar column update error:", err);
-        // We'll still consider the operation successful if only the DB update failed
-        // since we can still update the UI
-        toast({
-          title: "Avatar Updated (Partially)",
-          description: "Your avatar was uploaded but there was an issue saving it to your profile. Please contact support.",
-          variant: "destructive",
-          duration: 5000,
+         toast({
+            title: "Profile Update Issue",
+            description: "Avatar uploaded, but there was a database issue. Contact support.",
+            variant: "destructive",
+            duration: 5000,
         });
+         // Proceed to update UI anyway
       }
-      
+
       // Success
       toast({
         title: "Profile Picture Updated",
         description: "Your avatar has been successfully updated.",
         duration: 3000,
       });
-      
+
       // Update parent component
       onAvatarUpdate(urlData.publicUrl);
-      
+      setImageFile(null); // Clear file state after successful upload
+
       // Close dialog
       onClose();
     } catch (err: any) {
@@ -385,26 +481,19 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
     }
   };
 
-  // Check if device has camera capabilities
-  const checkCameraSupport = () => {
-    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-  };
-
-  const hasCameraSupport = checkCameraSupport();
-
   return (
     <>
       <Dialog open={isOpen} onOpenChange={(open) => {
         if (!open && !isSubmitting) {
-          stopCamera();
+          if (!isNative) stopWebCamera(); // Only stop web camera
           onClose();
         }
-      }} className="z-50">
+      }}>
         <DialogContent className="sm:max-w-[425px]">
           <DialogHeader>
             <DialogTitle>Update Profile Picture</DialogTitle>
             <DialogDescription>
-              Upload a new profile picture or take a photo with your camera.
+              Upload a new profile picture or take one {isNative ? "using the camera" : "with your webcam"}.
             </DialogDescription>
           </DialogHeader>
           
@@ -421,17 +510,25 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
           </div>
           
           <Tabs value={activeTab} onValueChange={(value) => {
-            setActiveTab(value);
-            if (value === "camera") {
-              startCamera();
-            } else {
-              stopCamera();
-            }
+             setActiveTab(value);
+             setError(null); // Clear error on tab change
+             if (!isNative && value === "camera") {
+                startWebCamera();
+             } else {
+                stopWebCamera(); // Stop web camera if switching away or on native
+             }
+             // Reset image preview if switching back to upload/camera from a preview state
+             if (value === "upload" || value === "camera") {
+                 if(imageFile) { // If there was a file selected/captured
+                    setImageFile(null);
+                    setImagePreview(currentAvatar || null); // Reset to original or fallback
+                 }
+             }
           }} className="w-full">
-            <TabsList className="grid w-full grid-cols-3">
-              {hasCameraSupport && (
+            <TabsList className={`grid w-full ${currentAvatar ? 'grid-cols-3' : 'grid-cols-2'}`}>
+              {hasCameraSupportState && (
                 <TabsTrigger value="camera" disabled={isSubmitting}>
-                  <Camera className="h-4 w-4 mr-2" />
+                  <CameraIconLucide className="h-4 w-4 mr-2" />
                   Camera
                 </TabsTrigger>
               )}
@@ -447,25 +544,45 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
               )}
             </TabsList>
 
-            {hasCameraSupport && (
+            {hasCameraSupportState && (
               <TabsContent value="camera" className="mt-4">
-                <div className="relative rounded-md overflow-hidden border">
-                  <video 
-                    ref={videoRef}
-                    autoPlay 
-                    playsInline
-                    className="w-full h-auto"
-                    style={{ maxHeight: "260px" }}
-                  />
-                </div>
-                <Button 
-                  onClick={capturePhoto} 
-                  className="w-full mt-4 bg-[#228B22] hover:bg-[#1a6b1a]"
-                  disabled={!cameraStream || isSubmitting}
-                >
-                  <Camera className="h-4 w-4 mr-2" />
-                  Capture Photo
-                </Button>
+                {isNative ? (
+                  // Native Camera Button
+                  <Button
+                    onClick={takeNativePhoto}
+                    className="w-full bg-[#228B22] hover:bg-[#1a6b1a]"
+                    disabled={isSubmitting}
+                  >
+                     {isSubmitting ? (
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                     ) : (
+                        <CameraIconLucide className="h-4 w-4 mr-2" />
+                     )}
+                    Open Camera
+                  </Button>
+                ) : (
+                  // Web Camera View & Capture
+                  <>
+                    <div className="relative rounded-md overflow-hidden border bg-gray-200 min-h-[200px]">
+                      <video
+                        ref={videoRef}
+                        autoPlay
+                        playsInline
+                        className="w-full h-auto"
+                        style={{ maxHeight: "260px" }}
+                        />
+                        {!cameraStream && <div className="absolute inset-0 flex items-center justify-center text-gray-500">Starting webcam...</div>}
+                    </div>
+                    <Button
+                      onClick={captureWebPhoto}
+                      className="w-full mt-4 bg-[#228B22] hover:bg-[#1a6b1a]"
+                      disabled={!cameraStream || isSubmitting}
+                    >
+                      <CameraIconLucide className="h-4 w-4 mr-2" />
+                      Capture Photo
+                    </Button>
+                  </>
+                )}
               </TabsContent>
             )}
             
@@ -519,7 +636,7 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
           
           {error && (
             <div className="text-sm text-red-500 flex items-center mt-4">
-              <AlertCircle className="h-3 w-3 mr-1" />
+              <AlertCircle className="h-3 w-3 mr-1 flex-shrink-0" />
               {error}
             </div>
           )}
@@ -528,8 +645,8 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
             <Button 
               variant="outline" 
               onClick={() => {
-                stopCamera();
-                onClose();
+                 if (!isNative) stopWebCamera();
+                 onClose();
               }}
               disabled={isSubmitting}
             >
@@ -537,7 +654,7 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
             </Button>
             {activeTab !== "remove" && imageFile && (
               <Button 
-                onClick={handleSubmit}
+                onClick={() => handleSubmit()}
                 disabled={isSubmitting || !imageFile}
                 className="bg-[#228B22] hover:bg-[#1a6b1a]"
               >
