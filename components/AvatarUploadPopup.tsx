@@ -17,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import imageCompression from "browser-image-compression";
 import { Capacitor } from '@capacitor/core';
 import { Camera, CameraResultType, CameraSource, PermissionStatus } from '@capacitor/camera';
+import { BackgroundTask } from '@capawesome/capacitor-background-task';
 
 interface AvatarUploadPopupProps {
   isOpen: boolean;
@@ -384,100 +385,129 @@ const AvatarUploadPopup: React.FC<AvatarUploadPopupProps> = ({
     setIsSubmitting(true);
     setError(null);
 
-    try {
-      // Upload the image to Supabase Storage
-      const filePath = `avatars/${userId}/${Date.now()}.jpg`;
+    // Define the core upload logic
+    const uploadLogic = async () => {
+        try {
+            // Upload the image to Supabase Storage
+            const filePath = `avatars/${userId}/${Date.now()}.jpg`;
 
-      const { data: uploadData, error: uploadError } = await supabase.storage
-        .from('avatars')
-        .upload(filePath, fileToSubmit, {
-          upsert: true,
-          contentType: 'image/jpeg'
-        });
+            const { data: uploadData, error: uploadError } = await supabase.storage
+                .from('avatars')
+                .upload(filePath, fileToSubmit!, { // Use non-null assertion as we checked above
+                upsert: true,
+                contentType: 'image/jpeg'
+                });
 
-      if (uploadError) {
-        throw uploadError;
-      }
-
-      // Get the public URL for the uploaded image
-      const { data: urlData } = await supabase.storage
-        .from('avatars')
-        .getPublicUrl(filePath);
-
-      if (!urlData?.publicUrl) {
-        throw new Error("Failed to get URL for uploaded image");
-      }
-
-      // Try to determine the correct column name in the users table
-      try {
-        // First, try with avatar_url
-        const { error: updateError } = await supabase
-          .from('users')
-          .update({ avatar_url: urlData.publicUrl })
-          .eq('id', userId);
-
-        if (updateError) {
-          console.error("Error updating with avatar_url, trying alternative field names:", updateError);
-
-          // If that fails, try alternative column names
-          const possibleFields = ['avatarUrl', 'avatar', 'profile_picture', 'profilePicture', 'photo'];
-          let updated = false;
-
-          for (const field of possibleFields) {
-            const updateData = { [field]: urlData.publicUrl };
-            const { error } = await supabase
-              .from('users')
-              .update(updateData)
-              .eq('id', userId);
-
-            if (!error) {
-              console.log(`Successfully updated avatar using field: ${field}`);
-              updated = true;
-              break;
+            if (uploadError) {
+                throw uploadError;
             }
-          }
 
-          if (!updated) {
-              // If still failing, log but don't block UI update
-             console.error("Could not update user profile with avatar URL after trying multiple fields.");
-             toast({
-                title: "Profile Updated (DB Error)",
-                description: "Avatar uploaded, but failed to link to profile. Contact support.",
-                variant: "destructive",
-                duration: 5000,
+            // Get the public URL for the uploaded image
+            const { data: urlData } = await supabase.storage
+                .from('avatars')
+                .getPublicUrl(filePath);
+
+            if (!urlData?.publicUrl) {
+                throw new Error("Failed to get URL for uploaded image");
+            }
+
+            // Try to determine the correct column name in the users table
+            try {
+                // First, try with avatar_url
+                const { error: updateError } = await supabase
+                .from('users')
+                .update({ avatar_url: urlData.publicUrl })
+                .eq('id', userId);
+
+                if (updateError) {
+                console.error("Error updating with avatar_url, trying alternative field names:", updateError);
+
+                // If that fails, try alternative column names
+                const possibleFields = ['avatarUrl', 'avatar', 'profile_picture', 'profilePicture', 'photo'];
+                let updated = false;
+
+                for (const field of possibleFields) {
+                    const updateData = { [field]: urlData.publicUrl };
+                    const { error } = await supabase
+                    .from('users')
+                    .update(updateData)
+                    .eq('id', userId);
+
+                    if (!error) {
+                    console.log(`Successfully updated avatar using field: ${field}`);
+                    updated = true;
+                    break;
+                    }
+                }
+
+                if (!updated) {
+                    // If still failing, log but don't block UI update
+                    console.error("Could not update user profile with avatar URL after trying multiple fields.");
+                    toast({
+                        title: "Profile Updated (DB Error)",
+                        description: "Avatar uploaded, but failed to link to profile. Contact support.",
+                        variant: "destructive",
+                        duration: 5000,
+                    });
+                    // Proceed to update UI anyway
+                }
+                }
+            } catch (err: any) {
+                console.error("Avatar column update error:", err);
+                toast({ // Generic DB error toast
+                    title: "Profile Update Issue",
+                    description: "Avatar uploaded, but there was a database issue. Contact support.",
+                    variant: "destructive",
+                    duration: 5000,
+                });
+                // Proceed to update UI anyway
+            }
+
+            // Success
+            toast({
+                title: "Profile Picture Updated",
+                description: "Your avatar has been successfully updated.",
+                duration: 3000,
             });
-             // Proceed to update UI anyway
-          }
+
+            // Update parent component
+            onAvatarUpdate(urlData.publicUrl);
+            setImageFile(null); // Clear file state after successful upload
+
+            // Close dialog
+            onClose();
+        } catch (err: any) {
+            console.error("Error updating avatar:", err);
+            setError(err.message || "Failed to update profile picture. Please try again.");
+        } finally {
+            setIsSubmitting(false);
+            // NOTE: BackgroundTask.finish() is called outside this function
         }
-      } catch (err: any) {
-        console.error("Avatar column update error:", err);
-         toast({
-            title: "Profile Update Issue",
-            description: "Avatar uploaded, but there was a database issue. Contact support.",
-            variant: "destructive",
-            duration: 5000,
-        });
-         // Proceed to update UI anyway
-      }
+    };
 
-      // Success
-      toast({
-        title: "Profile Picture Updated",
-        description: "Your avatar has been successfully updated.",
-        duration: 3000,
-      });
-
-      // Update parent component
-      onAvatarUpdate(urlData.publicUrl);
-      setImageFile(null); // Clear file state after successful upload
-
-      // Close dialog
-      onClose();
-    } catch (err: any) {
-      console.error("Error updating avatar:", err);
-      setError(err.message || "Failed to update profile picture. Please try again.");
-    } finally {
-      setIsSubmitting(false);
+    // Execute the logic, wrapping in BackgroundTask if native
+    if (isNative) {
+        let taskId: string | undefined;
+        try {
+            taskId = await BackgroundTask.beforeExit(async () => {
+                console.log('Background task started for avatar upload...');
+                await uploadLogic();
+                console.log('Background task finished for avatar upload.');
+                if (taskId) {
+                    BackgroundTask.finish({ taskId });
+                }
+            });
+        } catch (err) {
+            console.error('Failed to start background task for upload:', err);
+            // If background task fails to start, try running normally
+             setError('Failed to register background task. Uploading normally...');
+             await uploadLogic(); // Attempt foreground upload as fallback
+             // Ensure submitting state is reset if foreground fallback also fails instantly
+             if(isSubmitting) setIsSubmitting(false);
+        }
+    } else {
+        // Run directly if not native
+        await uploadLogic();
     }
   };
 
